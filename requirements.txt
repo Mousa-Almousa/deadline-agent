@@ -1,0 +1,14 @@
+# Dependencies for the deadline agent (deadline_to_calendar.py).
+#
+# This is deliberately NOT a full `pip freeze`. The virtualenv also contains
+# sentence-transformers, torch, and friends (~2 GB) pulled in by
+# learning/embed_test.py, which the agent itself never imports.
+#
+# Install with:  pip install -r requirements.txt
+
+anthropic==0.122.0
+google-api-python-client==2.199.0
+google-auth==2.56.3
+google-auth-httplib2==0.4.1
+google-auth-oauthlib==1.4.0
+python-dotenv==1.2.2
