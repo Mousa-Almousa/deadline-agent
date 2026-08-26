@@ -38,11 +38,14 @@ def sign_in_with_browser():
     # never email you about, because sending mail needs the sign-in that's
     # stuck. Fail loudly and fast instead.
     if not sys.stdin.isatty() and os.getenv("ALLOW_BROWSER_AUTH") != "1":
+        # Work out the path at runtime rather than hardcoding it, so this
+        # message stays right even if the project folder gets renamed.
+        project_dir = os.path.dirname(os.path.abspath(__file__))
         raise RuntimeError(
             "Google sign-in is needed, but this run isn't interactive "
             "(no terminal attached), so no browser can be opened.\n"
             "Run this by hand once to sign in:\n"
-            "    cd ~/email-classifier && ./venv/bin/python deadline_to_calendar.py"
+            f"    cd {project_dir} && ./venv/bin/python deadline_to_calendar.py"
         )
 
     flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
