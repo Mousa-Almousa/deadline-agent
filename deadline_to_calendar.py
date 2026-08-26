@@ -1,98 +1,254 @@
 import os
 import json
+import traceback
 from datetime import date
+
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
+import alerts
+
 load_dotenv()
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# --- Settings you might want to change ---
+TIMEZONE = "Asia/Riyadh"
+MAX_EMAILS = 10
+MODEL = "claude-haiku-4-5-20251001"
+SEEN_FILE = "processed.json"
+TOKEN_FILE = "token.json"
+CREDENTIALS_FILE = "credentials.json"
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.events",
 ]
-if os.path.exists("token.json"):
-    creds = Credentials.from_authorized_user_file("token.json", SCOPES)
-else:
-    flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-    creds = flow.run_local_server(port=0)
-    with open("token.json", "w") as f:
-        f.write(creds.to_json())
 
-gmail = build("gmail", "v1", credentials=creds)
-calendar = build("calendar", "v3", credentials=creds)
 
-today = date.today()
+def get_credentials():
+    """Log in to Google, reusing the saved token when we can.
 
-# NEW: load the list of email IDs we've already processed (once, before the loop)
-SEEN_FILE = "processed.json"
-if os.path.exists(SEEN_FILE):
-    with open(SEEN_FILE) as f:
-        seen_ids = json.load(f)
-else:
-    seen_ids = []
+    Three cases, in order:
+      1. Saved token is still good        -> use it.
+      2. Saved token expired but renewable -> refresh it, save the new one.
+      3. No token, or we added a new scope -> open the browser once.
+    """
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-results = gmail.users().messages().list(userId="me", maxResults=10).execute()
-messages = results.get("messages", [])
-print(f"Found {len(messages)} emails.\n")
+    # has_scopes() catches the case where we added gmail.send to SCOPES but the
+    # saved token predates it -- without this you'd get a confusing 403 later.
+    if creds and not creds.has_scopes(SCOPES):
+        creds = None
 
-system_prompt = f"""Today's date is {today}.
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            creds = flow.run_local_server(port=0)
+
+        # Save whatever we ended up with, so the next hourly run reuses it.
+        # The original version never wrote refreshed tokens back to disk.
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+
+    return creds
+
+
+def load_seen_ids():
+    """Email IDs we've already handled, as a set so lookups are instant."""
+    if not os.path.exists(SEEN_FILE):
+        return set()
+    try:
+        with open(SEEN_FILE) as f:
+            return set(json.load(f))
+    except (json.JSONDecodeError, OSError):
+        print(f"WARNING: {SEEN_FILE} unreadable, treating all emails as new.")
+        return set()
+
+
+def save_seen_ids(seen_ids):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(sorted(seen_ids), f)
+
+
+def build_system_prompt():
+    today = date.today()
+    return f"""Today's date is {today}.
 You extract assignment and exam deadlines from emails.
 If the email gives a date without a year, assume the next time that date occurs after today.
 Reply ONLY with JSON in this exact format, nothing else:
 {{"has_deadline": true, "task": "what is due", "course": "course name or Unknown", "due_date": "YYYY-MM-DD", "due_time": "HH:MM or Unknown"}}
 If the email has no deadline, reply exactly: {{"has_deadline": false}}"""
 
-for msg in messages:
-    # NEW: skip already-processed emails BEFORE spending anything on the API
-    if msg["id"] in seen_ids:
-        continue
 
-    full = gmail.users().messages().get(userId="me", id=msg["id"]).execute()
+def read_email(gmail, message_id):
+    """Pull the subject and preview text for one email."""
+    full = gmail.users().messages().get(userId="me", id=message_id).execute()
     headers = full["payload"]["headers"]
-    subject = next((h["value"] for h in headers if h["name"] == "Subject"), "(no subject)")
+    subject = next(
+        (h["value"] for h in headers if h["name"] == "Subject"), "(no subject)"
+    )
     snippet = full.get("snippet", "")
-    email_text = f"Subject: {subject}\n\n{snippet}"
+    return subject, f"Subject: {subject}\n\n{snippet}"
 
+
+def extract_deadline(client, system_prompt, email_text):
+    """Ask Claude for the deadline. Returns a dict, or None if it wasn't valid JSON."""
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=MODEL,
         max_tokens=300,
         system=system_prompt,
-        messages=[{"role": "user", "content": email_text}]
+        messages=[{"role": "user", "content": email_text}],
     )
 
     answer = response.content[0].text
     cleaned = answer.replace("```json", "").replace("```", "").strip()
-    data = json.loads(cleaned)
 
-    print("Email:", subject)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        # Claude returned something that wasn't JSON. Don't kill the whole run
+        # over one weird email -- report it and let the caller keep going.
+        print(f"  Could not parse Claude's reply: {cleaned[:200]!r}")
+        return None
 
-    if data["has_deadline"]:
-        title = f"{data['course']}: {data['task']}"
-        if data["due_time"] == "Unknown":
-            event = {
-                "summary": title,
-                "start": {"date": data["due_date"]},
-                "end": {"date": data["due_date"]},
-            }
-        else:
-            start = f"{data['due_date']}T{data['due_time']}:00"
-            event = {
-                "summary": title,
-                "start": {"dateTime": start, "timeZone": "Asia/Riyadh"},
-                "end": {"dateTime": start, "timeZone": "Asia/Riyadh"},
-            }
-        calendar.events().insert(calendarId="primary", body=event).execute()
-        print("  Added to calendar:", title, "on", data["due_date"])
+
+def add_to_calendar(calendar, data):
+    """Create the calendar event and return its title."""
+    title = f"{data['course']}: {data['task']}"
+
+    if data.get("due_time", "Unknown") == "Unknown":
+        event = {
+            "summary": title,
+            "start": {"date": data["due_date"]},
+            "end": {"date": data["due_date"]},
+        }
     else:
-        print("  No deadline found.")
+        start = f"{data['due_date']}T{data['due_time']}:00"
+        event = {
+            "summary": title,
+            "start": {"dateTime": start, "timeZone": TIMEZONE},
+            "end": {"dateTime": start, "timeZone": TIMEZONE},
+        }
 
-    # NEW: mark this email as processed and save immediately
-    seen_ids.append(msg["id"])
-    with open(SEEN_FILE, "w") as f:
-        json.dump(seen_ids, f)
+    calendar.events().insert(calendarId="primary", body=event).execute()
+    return title
 
-    print("---")
+
+# Set as soon as we're connected to Gmail. The crash handler at the bottom
+# reads this so it can still email you about a failure that happened halfway
+# through the run. "global" below means "assign to this outer variable,
+# don't make a new local one with the same name".
+GMAIL = None
+
+
+def main():
+    global GMAIL
+
+    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    creds = get_credentials()
+    gmail = build("gmail", "v1", credentials=creds)
+    calendar = build("calendar", "v3", credentials=creds)
+    GMAIL = gmail
+
+    seen_ids = load_seen_ids()
+    system_prompt = build_system_prompt()
+
+    results = gmail.users().messages().list(userId="me", maxResults=MAX_EMAILS).execute()
+    messages = results.get("messages", [])
+    print(f"Found {len(messages)} emails.\n")
+
+    # Problems pile up here instead of crashing the run. The two kinds are
+    # tracked separately because they behave differently on the next run:
+    #   skipped -> marked as processed, will NOT be retried
+    #   errors  -> not marked, so the next run tries them again
+    skipped = []
+    errors = []
+
+    for msg in messages:
+        if msg["id"] in seen_ids:
+            continue
+
+        try:
+            subject, email_text = read_email(gmail, msg["id"])
+            print("Email:", subject)
+
+            data = extract_deadline(client, system_prompt, email_text)
+
+            if data is None:
+                # Marked as processed below on purpose: an email Claude can't
+                # parse would otherwise be retried every hour forever, costing
+                # an API call each time. You get one alert, then we move on.
+                skipped.append(f"- {subject}\n  Claude's reply wasn't valid JSON.")
+            elif data.get("has_deadline"):
+                title = add_to_calendar(calendar, data)
+                print("  Added to calendar:", title, "on", data["due_date"])
+            else:
+                print("  No deadline found.")
+
+            seen_ids.add(msg["id"])
+            save_seen_ids(seen_ids)
+
+        except Exception as exc:
+            # One bad email shouldn't stop the other nine from being processed.
+            print(f"  ERROR on this email: {type(exc).__name__}: {exc}")
+            errors.append(
+                f"- message id {msg['id']}\n  {type(exc).__name__}: {exc}"
+            )
+
+        print("---")
+
+    if skipped or errors:
+        sections = [
+            f"The deadline agent finished, but "
+            f"{len(skipped) + len(errors)} email(s) had problems."
+        ]
+        if skipped:
+            sections.append(
+                f"SKIPPED ({len(skipped)}) - marked as processed, will NOT be "
+                f"retried. Check these by hand if you were expecting a "
+                f"deadline:\n\n" + "\n\n".join(skipped)
+            )
+        if errors:
+            sections.append(
+                f"ERRORS ({len(errors)}) - not marked as processed, the next "
+                f"run will try again:\n\n" + "\n\n".join(errors)
+            )
+
+        alerts.send_alert(
+            gmail,
+            f"{len(skipped) + len(errors)} email(s) had problems",
+            "\n\n".join(sections),
+            kind="per_email_failure",
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        # Something broke badly enough to stop the whole run.
+        report = (
+            f"The deadline agent crashed and did not finish.\n\n"
+            f"{type(exc).__name__}: {exc}\n\n"
+            f"Full traceback:\n{traceback.format_exc()}"
+        )
+        print(report)
+
+        if GMAIL is not None:
+            alerts.send_alert(GMAIL, "Agent crashed", report,
+                              kind=f"crash:{type(exc).__name__}")
+        else:
+            # We crashed before Gmail was ready, so we can't send mail at all.
+            # This lands in the cron log (~/deadline.log) instead.
+            print("[alerts] crashed before Gmail was available - no email sent.")
+
+        raise SystemExit(1)

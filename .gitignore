@@ -3,3 +3,7 @@ venv/
 credentials.json
 token.json
 processed.json
+alert_state.json
+__pycache__/
+*.pyc
+.DS_Store
