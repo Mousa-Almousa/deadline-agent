@@ -6,6 +6,7 @@ from datetime import date
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from anthropic import Anthropic
@@ -30,46 +31,69 @@ SCOPES = [
 ]
 
 
+def sign_in_with_browser():
+    """Open the browser for Google sign-in. Needs a human at the keyboard."""
+    # Under cron there is no human and no browser, and run_local_server() would
+    # sit there blocking forever -- a hung process every hour that we could
+    # never email you about, because sending mail needs the sign-in that's
+    # stuck. Fail loudly and fast instead.
+    if not sys.stdin.isatty() and os.getenv("ALLOW_BROWSER_AUTH") != "1":
+        raise RuntimeError(
+            "Google sign-in is needed, but this run isn't interactive "
+            "(no terminal attached), so no browser can be opened.\n"
+            "Run this by hand once to sign in:\n"
+            "    cd ~/email-classifier && ./venv/bin/python deadline_to_calendar.py"
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+    return flow.run_local_server(port=0)
+
+
 def get_credentials():
     """Log in to Google, reusing the saved token when we can.
 
-    Three cases, in order:
-      1. Saved token is still good        -> use it.
-      2. Saved token expired but renewable -> refresh it, save the new one.
-      3. No token, or we added a new scope -> open the browser once.
+    Four cases, in order:
+      1. Saved token covers everything and is valid -> use it.
+      2. Saved token is missing a permission        -> sign in again.
+      3. Saved token expired but renewable          -> refresh, save the new one.
+      4. No token, or the refresh is rejected       -> sign in again.
     """
     creds = None
     if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        try:
+            # NO scopes argument on purpose. Passing SCOPES here overwrites the
+            # token's real granted scopes with the ones we *want*, which makes
+            # the has_scopes() check below compare SCOPES against SCOPES and
+            # always say yes. Omitting it reads what Google actually granted.
+            creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+        except (ValueError, json.JSONDecodeError, OSError) as exc:
+            print(f"Saved token unreadable ({exc}); signing in again.")
+            creds = None
 
-    # has_scopes() catches the case where we added gmail.send to SCOPES but the
-    # saved token predates it -- without this you'd get a confusing 403 later.
     if creds and not creds.has_scopes(SCOPES):
+        missing = [s for s in SCOPES if s not in (creds.scopes or [])]
+        print(f"Saved sign-in is missing: {', '.join(missing)}")
+        print("Signing in again to approve it.")
         creds = None
 
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
+    if creds and creds.valid:
+        return creds
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            # Opening a browser needs a human. Under cron there isn't one, and
-            # run_local_server() would sit there blocking forever -- a hung
-            # process every hour that we could never email you about, because
-            # we aren't signed in yet. Fail loudly and fast instead.
-            if not sys.stdin.isatty() and os.getenv("ALLOW_BROWSER_AUTH") != "1":
-                raise RuntimeError(
-                    "Google sign-in is needed, but this run isn't interactive "
-                    "(no terminal attached), so no browser can be opened.\n"
-                    "Run this by hand once to sign in:\n"
-                    "    cd ~/email-classifier && ./venv/bin/python deadline_to_calendar.py"
-                )
+        except RefreshError as exc:
+            # Token revoked, expired past renewal, or scopes changed underneath
+            # us. Not fatal -- just sign in again rather than crashing.
+            print(f"Could not renew saved sign-in ({exc}); signing in again.")
+            creds = sign_in_with_browser()
+    else:
+        creds = sign_in_with_browser()
 
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-
-        # Save whatever we ended up with, so the next hourly run reuses it.
-        # The original version never wrote refreshed tokens back to disk.
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+    # Save whatever we ended up with, so the next hourly run reuses it.
+    # The original version never wrote refreshed tokens back to disk.
+    with open(TOKEN_FILE, "w") as f:
+        f.write(creds.to_json())
 
     return creds
 
