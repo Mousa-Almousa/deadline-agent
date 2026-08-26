@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import traceback
 from datetime import date
@@ -50,6 +51,18 @@ def get_credentials():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
+            # Opening a browser needs a human. Under cron there isn't one, and
+            # run_local_server() would sit there blocking forever -- a hung
+            # process every hour that we could never email you about, because
+            # we aren't signed in yet. Fail loudly and fast instead.
+            if not sys.stdin.isatty() and os.getenv("ALLOW_BROWSER_AUTH") != "1":
+                raise RuntimeError(
+                    "Google sign-in is needed, but this run isn't interactive "
+                    "(no terminal attached), so no browser can be opened.\n"
+                    "Run this by hand once to sign in:\n"
+                    "    cd ~/email-classifier && ./venv/bin/python deadline_to_calendar.py"
+                )
+
             flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
             creds = flow.run_local_server(port=0)
 
