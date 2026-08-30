@@ -126,6 +126,20 @@ the next run:
 Alerts are grouped by error type with a **6-hour cooldown**, so a persistent
 failure sends one email rather than 24 a day.
 
+**Set `ALERT_EMAIL` in `.env`.** Without it, alerts go to the Gmail account the
+agent signs in as -- which means they land in the same mailbox it scans, so the
+agent reads its own alerts, and you only see them if you check that account.
+Point it at the address you actually read.
+
+Two failures used to be invisible, and aren't any more:
+
+- **Transient network errors** (a dropped connection to Google's token
+  endpoint) are retried three times with backoff before the run is failed at
+  all. This is what killed a run on 2026-08-26.
+- **Crashes before sign-in** can't email you, because sending needs the auth
+  that just broke. The alert is now saved to `pending_alerts.json` and sent by
+  the next run that reaches Gmail.
+
 To send yourself a test alert:
 
 ```bash
@@ -149,8 +163,15 @@ Being honest about what this doesn't do:
 - **Alerts can't report a run that never happened.** The alert is sent *by* the
   agent, so if the Mac is asleep and cron never fires, nothing is sent and
   nothing warns you. Covering that needs an external dead-man's-switch service.
-- **A failure during sign-in can't email you**, because sending mail requires
-  the sign-in that just broke. Those land in the cron log only.
+- **A failure during sign-in is reported late, not never.** Sending mail needs
+  the sign-in that just broke, so the alert is written to `pending_alerts.json`
+  and emailed by the next run that reaches Gmail. If the machine never gets
+  online again, you never hear about it.
+- **Relative dates are resolved to the soonest match.** "next Thursday" is
+  treated as the coming Thursday, never a week later. When the wording is
+  genuinely ambiguous the event title gets `(verify date)` and the description
+  explains why -- a confidently wrong date is worse than an obviously uncertain
+  one.
 - **Timezone is hardcoded** to `Asia/Riyadh` in `TIMEZONE`.
 - **No test suite yet.**
 

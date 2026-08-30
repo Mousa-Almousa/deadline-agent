@@ -1,12 +1,13 @@
 import os
 import sys
 import json
+import time
 import traceback
 from datetime import date
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from anthropic import Anthropic
@@ -29,6 +30,27 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/calendar.events",
 ]
+
+
+# A dropped connection shouldn't kill an hourly job. The agent already died
+# once on a Read timed out to Google's token endpoint -- retrying absorbs that.
+TRANSIENT_ERRORS = (TransportError, TimeoutError, ConnectionError)
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 5
+
+
+def with_retries(label, func):
+    """Run func(), retrying a few times on transient network errors."""
+    for attempt in range(1, RETRY_ATTEMPTS + 1):
+        try:
+            return func()
+        except TRANSIENT_ERRORS as exc:
+            if attempt == RETRY_ATTEMPTS:
+                raise
+            wait = RETRY_BACKOFF_SECONDS * attempt
+            print(f"  {label} failed ({type(exc).__name__}); "
+                  f"retry {attempt}/{RETRY_ATTEMPTS - 1} in {wait}s")
+            time.sleep(wait)
 
 
 def sign_in_with_browser():
@@ -84,7 +106,7 @@ def get_credentials():
 
     if creds and creds.expired and creds.refresh_token:
         try:
-            creds.refresh(Request())
+            with_retries("token refresh", lambda: creds.refresh(Request()))
         except RefreshError as exc:
             # Token revoked, expired past renewal, or scopes changed underneath
             # us. Not fatal -- just sign in again rather than crashing.
@@ -120,11 +142,25 @@ def save_seen_ids(seen_ids):
 
 def build_system_prompt():
     today = date.today()
-    return f"""Today's date is {today}.
-You extract assignment and exam deadlines from emails.
-If the email gives a date without a year, assume the next time that date occurs after today.
+    return f"""Today's date is {today}, which is a {today.strftime("%A")}.
+You extract assignment and exam deadlines from emails. Emails may be in English
+or Arabic. Arabic-Indic numerals (٠١٢٣٤٥٦٧٨٩) are ordinary digits.
+
+Resolving dates:
+- A date with no year means the next time that date occurs after today.
+- A weekday name ("Thursday", "الخميس") means the SOONEST occurrence of that
+  weekday after today. Never skip a week -- treat "next Thursday" and
+  "Thursday" as the same day.
+- "tomorrow", "بكرة" and "غدا" mean the day after today.
+- Set "date_ambiguous" to true ONLY when the wording could reasonably mean a
+  different week, such as "next Thursday" or "الخميس القادم". Use false for an
+  explicit date or a plain weekday.
+
+Only graded academic work counts: assignments, exams, quizzes, projects,
+submissions. Social plans, invitations and meetings are NOT deadlines.
+
 Reply ONLY with JSON in this exact format, nothing else:
-{{"has_deadline": true, "task": "what is due", "course": "course name or Unknown", "due_date": "YYYY-MM-DD", "due_time": "HH:MM or Unknown"}}
+{{"has_deadline": true, "task": "what is due", "course": "course name or Unknown", "due_date": "YYYY-MM-DD", "due_time": "HH:MM or Unknown", "date_ambiguous": false}}
 If the email has no deadline, reply exactly: {{"has_deadline": false}}"""
 
 
@@ -160,13 +196,28 @@ def extract_deadline(client, system_prompt, email_text):
         return None
 
 
-def add_to_calendar(calendar, data):
+def add_to_calendar(calendar, data, source_subject=""):
     """Create the calendar event and return its title."""
     title = f"{data['course']}: {data['task']}"
+
+    # A confidently wrong date is worse than an obviously uncertain one, so
+    # say so in the title when the email's wording could mean another week.
+    if data.get("date_ambiguous"):
+        title += " (verify date)"
+
+    notes = [f"Added automatically by the deadline agent from: {source_subject}"]
+    if data.get("date_ambiguous"):
+        notes.append(
+            "WARNING: the email used relative wording (e.g. 'next Thursday'). "
+            "This date was resolved to the soonest matching day -- check the "
+            "original email before relying on it."
+        )
+    description = "\n\n".join(notes)
 
     if data.get("due_time", "Unknown") == "Unknown":
         event = {
             "summary": title,
+            "description": description,
             "start": {"date": data["due_date"]},
             "end": {"date": data["due_date"]},
         }
@@ -174,6 +225,7 @@ def add_to_calendar(calendar, data):
         start = f"{data['due_date']}T{data['due_time']}:00"
         event = {
             "summary": title,
+            "description": description,
             "start": {"dateTime": start, "timeZone": TIMEZONE},
             "end": {"dateTime": start, "timeZone": TIMEZONE},
         }
@@ -198,6 +250,9 @@ def main():
     gmail = build("gmail", "v1", credentials=creds)
     calendar = build("calendar", "v3", credentials=creds)
     GMAIL = gmail
+
+    # Anything that failed before sign-in on an earlier run gets mailed now.
+    alerts.flush_pending(gmail)
 
     seen_ids = load_seen_ids()
     system_prompt = build_system_prompt()
@@ -229,7 +284,7 @@ def main():
                 # an API call each time. You get one alert, then we move on.
                 skipped.append(f"- {subject}\n  Claude's reply wasn't valid JSON.")
             elif data.get("has_deadline"):
-                title = add_to_calendar(calendar, data)
+                title = add_to_calendar(calendar, data, subject)
                 print("  Added to calendar:", title, "on", data["due_date"])
             else:
                 print("  No deadline found.")
@@ -287,8 +342,9 @@ if __name__ == "__main__":
             alerts.send_alert(GMAIL, "Agent crashed", report,
                               kind=f"crash:{type(exc).__name__}")
         else:
-            # We crashed before Gmail was ready, so we can't send mail at all.
-            # This lands in the cron log (~/deadline.log) instead.
-            print("[alerts] crashed before Gmail was available - no email sent.")
+            # We crashed before Gmail was ready, so we can't send mail now.
+            # Save it: the next run that reaches Gmail will send it for us.
+            alerts.queue_alert("Agent crashed before sign-in", report,
+                               kind=f"crash:{type(exc).__name__}")
 
         raise SystemExit(1)
