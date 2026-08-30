@@ -155,9 +155,9 @@ alerts.send_alert(build('gmail','v1',credentials=get_credentials()),
 
 Being honest about what this doesn't do:
 
-- **It only reads the Gmail preview snippet**, not the full email body. A
-  deadline mentioned deep in a long email will be missed. Parsing the full
-  MIME body is the obvious next step.
+- **HTML-only emails fall back to the preview snippet.** The agent reads the
+  `text/plain` part of a message; if there isn't one, it uses Gmail's snippet
+  and may miss content. Bodies are also truncated at `MAX_BODY_CHARS`.
 - **Deduplication is per-email, not per-deadline.** If the same assignment is
   mentioned in two separate emails, you get two calendar events.
 - **Alerts can't report a run that never happened.** The alert is sent *by* the

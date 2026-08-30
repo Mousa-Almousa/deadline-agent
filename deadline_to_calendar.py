@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import base64
 import time
 import traceback
 from datetime import date
@@ -20,6 +21,7 @@ load_dotenv()
 # --- Settings you might want to change ---
 TIMEZONE = "Asia/Riyadh"
 MAX_EMAILS = 10
+MAX_BODY_CHARS = 2000
 MODEL = "claude-haiku-4-5-20251001"
 SEEN_FILE = "processed.json"
 TOKEN_FILE = "token.json"
@@ -142,7 +144,7 @@ def save_seen_ids(seen_ids):
 
 def build_system_prompt():
     today = date.today()
-    return f"""Today's date is {today}, which is a {today.strftime("%A")}.
+    prompt = f"""Today's date is {today}, which is a {today.strftime("%A")}.
 You extract assignment and exam deadlines from emails. Emails may be in English
 or Arabic. Arabic-Indic numerals (٠١٢٣٤٥٦٧٨٩) are ordinary digits.
 
@@ -163,6 +165,52 @@ Reply ONLY with JSON in this exact format, nothing else:
 {{"has_deadline": true, "task": "what is due", "course": "course name or Unknown", "due_date": "YYYY-MM-DD", "due_time": "HH:MM or Unknown", "date_ambiguous": false}}
 If the email has no deadline, reply exactly: {{"has_deadline": false}}"""
 
+    # Optional per-machine rules, read from EXTRA_RULES in .env. Lets you tune
+    # what counts as a deadline for your own inbox without editing this file.
+    extra = os.getenv("EXTRA_RULES", "").strip()
+    if extra:
+        prompt += f"\n\nAdditional rules:\n{extra}"
+
+    return prompt
+
+
+def plain_text_body(part):
+    """Find the text/plain part of an email, walking nested MIME parts.
+
+    Emails are a tree: a forwarded message is often multipart/alternative with
+    a text/plain and a text/html child. We want the plain one.
+    """
+    if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+        raw = base64.urlsafe_b64decode(part["body"]["data"])
+        return raw.decode("utf-8", "replace")
+    for child in part.get("parts", []) or []:
+        found = plain_text_body(child)
+        if found:
+            return found
+    return ""
+
+
+def clean_body(text):
+    """Drop the boilerplate that pads out university email."""
+    # The KSU legal disclaimer is ~1000 chars of noise on every message.
+    for marker in ("Disclaimer:", "This communication is intended for"):
+        if marker in text:
+            text = text.split(marker)[0]
+
+    # Collapse runs of blank lines left behind by forwarding.
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    out, blank = [], False
+    for ln in lines:
+        if not ln:
+            if not blank:
+                out.append("")
+            blank = True
+        else:
+            out.append(ln)
+            blank = False
+
+    return "\n".join(out).strip()[:MAX_BODY_CHARS]
+
 
 def read_email(gmail, message_id):
     """Pull the subject and preview text for one email."""
@@ -171,8 +219,15 @@ def read_email(gmail, message_id):
     subject = next(
         (h["value"] for h in headers if h["name"] == "Subject"), "(no subject)"
     )
-    snippet = full.get("snippet", "")
-    return subject, f"Subject: {subject}\n\n{snippet}"
+
+    # The snippet is only Gmail's ~200-char preview. On a forwarded email that
+    # is entirely "Get Outlook for iOS" plus From/Sent/To headers, so the real
+    # message never reached Claude. Read the actual body instead.
+    body = clean_body(plain_text_body(full["payload"]))
+    if not body:
+        body = full.get("snippet", "")
+
+    return subject, f"Subject: {subject}\n\n{body}"
 
 
 def extract_deadline(client, system_prompt, email_text):
@@ -187,13 +242,21 @@ def extract_deadline(client, system_prompt, email_text):
     answer = response.content[0].text
     cleaned = answer.replace("```json", "").replace("```", "").strip()
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        # Claude returned something that wasn't JSON. Don't kill the whole run
-        # over one weird email -- report it and let the caller keep going.
-        print(f"  Could not parse Claude's reply: {cleaned[:200]!r}")
-        return None
+    # Claude sometimes answers correctly and then adds a sentence explaining
+    # itself. Plain json.loads() rejects that with "Extra data", so we decode
+    # only the first JSON object and ignore whatever follows it.
+    start = cleaned.find("{")
+    if start != -1:
+        try:
+            data, _end = json.JSONDecoder().raw_decode(cleaned[start:])
+            return data
+        except json.JSONDecodeError:
+            pass
+
+    # Genuinely unparseable. Don't kill the whole run over one weird email --
+    # report it and let the caller keep going.
+    print(f"  Could not parse Claude's reply: {cleaned[:200]!r}")
+    return None
 
 
 def add_to_calendar(calendar, data, source_subject=""):
