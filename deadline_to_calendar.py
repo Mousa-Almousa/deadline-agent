@@ -22,6 +22,13 @@ load_dotenv()
 TIMEZONE = "Asia/Riyadh"
 MAX_EMAILS = 10
 MAX_BODY_CHARS = 2000
+
+# Which messages to scan. Without a query, Gmail's list() returns every label,
+# including Sent -- so the agent read the alert emails it had just sent itself
+# and paid for a Claude call to decide each one wasn't a deadline. Real mail
+# also got pushed out of the MAX_EMAILS window by that noise.
+# This is ordinary Gmail search syntax, the same as the search box.
+GMAIL_QUERY = 'in:inbox -subject:"[Deadline Agent]"' 
 MODEL = "claude-haiku-4-5-20251001"
 SEEN_FILE = "processed.json"
 TOKEN_FILE = "token.json"
@@ -320,7 +327,9 @@ def main():
     seen_ids = load_seen_ids()
     system_prompt = build_system_prompt()
 
-    results = gmail.users().messages().list(userId="me", maxResults=MAX_EMAILS).execute()
+    results = gmail.users().messages().list(
+        userId="me", q=GMAIL_QUERY, maxResults=MAX_EMAILS
+    ).execute()
     messages = results.get("messages", [])
     print(f"Found {len(messages)} emails.\n")
 
